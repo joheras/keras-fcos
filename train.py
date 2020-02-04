@@ -198,6 +198,11 @@ def create_callbacks(model, training_model, prediction_model, validation_generat
     return callbacks
 
 
+def read_classes(path):
+   classesLeidas = open(os.path.join(path, 'classes.csv')).readlines()
+   return {classLine.split(',')[0]:int(classLine.split(',')[1]) for classLine in classesLeidas}
+
+
 def create_generators(args, preprocess_image):
     """
     Create generators for training and validation.
@@ -273,6 +278,26 @@ def create_generators(args, preprocess_image):
             skip_difficult=True,
             **common_args
         )
+
+    elif args.dataset_type == 'pascalCustom':
+        train_generator = PascalVocGenerator(
+            args.pascal_path,
+            'train',
+            classes=read_classes(args.pascal_path),
+            transform_generator=transform_generator,
+            visual_effect_generator=visual_effect_generator,
+            skip_difficult=True,
+            **common_args
+        )
+
+        validation_generator = PascalVocGenerator(
+            args.pascal_path,
+            'test',
+            classes=read_classes(args.pascal_path),
+            shuffle_groups=False,
+            skip_difficult=True,
+            **common_args
+        )
     else:
         raise ValueError('Invalid data type received: {}'.format(args.dataset_type))
 
@@ -326,6 +351,9 @@ def parse_args(args):
 
     pascal_parser = subparsers.add_parser('pascal')
     pascal_parser.add_argument('pascal_path', help='Path to dataset directory (ie. /tmp/VOCdevkit).')
+
+    pascalCustom_parser = subparsers.add_parser('pascalCustom')
+    pascalCustom_parser.add_argument('pascal_path', help='Path to dataset directory (ie. /tmp/VOCdevkit).')
 
     csv_parser = subparsers.add_parser('csv')
     csv_parser.add_argument('annotations_path', help='Path to CSV file containing annotations for training.')
@@ -477,3 +505,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
