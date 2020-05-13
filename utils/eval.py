@@ -17,10 +17,7 @@ limitations under the License.
 from utils.compute_overlap import compute_overlap
 from utils.visualization import draw_detections, draw_annotations
 
-import keras
 import numpy as np
-import os
-import pickle
 import cv2
 import progressbar
 
@@ -59,7 +56,7 @@ def _compute_ap(recall, precision):
     return ap
 
 
-def _get_detections(generator, model, score_threshold=0.05, max_detections=100, save_path=None):
+def _get_detections(generator, model, score_threshold=0.05, max_detections=100, visualize=False):
     """
     Get the detections from the model using the generator.
 
@@ -81,15 +78,23 @@ def _get_detections(generator, model, score_threshold=0.05, max_detections=100, 
                       range(generator.size())]
 
     for i in progressbar.progressbar(range(generator.size()), prefix='Running network: '):
-        raw_image = generator.load_image(i)
-        image = generator.preprocess_image(raw_image.copy())
-        image, scale = generator.resize_image(image)
+        image = generator.load_image(i)
+        src_image = image.copy()
+        h, w = image.shape[:2]
+
+        anchors = generator.anchors
+        image, scale, offset_h, offset_w = generator.preprocess_image(image)
 
         # run network
-        boxes, scores, labels = model.predict_on_batch(np.expand_dims(image, axis=0))[:3]
-
-        # correct boxes for image scale
+        boxes, scores, labels = model.predict_on_batch([np.expand_dims(image, axis=0),
+                                                        np.expand_dims(anchors, axis=0)])
+        boxes[..., [0, 2]] = boxes[..., [0, 2]] - offset_w
+        boxes[..., [1, 3]] = boxes[..., [1, 3]] - offset_h
         boxes /= scale
+        boxes[:, :, 0] = np.clip(boxes[:, :, 0], 0, w - 1)
+        boxes[:, :, 1] = np.clip(boxes[:, :, 1], 0, h - 1)
+        boxes[:, :, 2] = np.clip(boxes[:, :, 2], 0, w - 1)
+        boxes[:, :, 3] = np.clip(boxes[:, :, 3], 0, h - 1)
 
         # select indices which have a score above the threshold
         indices = np.where(scores[0, :] > score_threshold)[0]
@@ -108,22 +113,23 @@ def _get_detections(generator, model, score_threshold=0.05, max_detections=100, 
         # (n, )
         image_labels = labels[0, indices[scores_sort]]
         # (n, 6)
-        image_detections = np.concatenate(
+        detections = np.concatenate(
             [image_boxes, np.expand_dims(image_scores, axis=1), np.expand_dims(image_labels, axis=1)], axis=1)
 
-        if save_path is not None:
-            draw_annotations(raw_image, generator.load_annotations(i), label_to_name=generator.label_to_name)
-            draw_detections(raw_image, image_boxes, image_scores, image_labels, label_to_name=generator.label_to_name,
+        if visualize:
+            draw_annotations(src_image, generator.load_annotations(i), label_to_name=generator.label_to_name)
+            draw_detections(src_image, detections[:5, :4], detections[:5, 4], detections[:5, 5].astype(np.int32),
+                            label_to_name=generator.label_to_name,
                             score_threshold=score_threshold)
 
-            cv2.imwrite(os.path.join(save_path, '{}.png'.format(i)), raw_image)
+            # cv2.imwrite(os.path.join(save_path, '{}.png'.format(i)), raw_image)
+            cv2.namedWindow('{}'.format(i), cv2.WINDOW_NORMAL)
+            cv2.imshow('{}'.format(i), src_image)
+            cv2.waitKey(0)
 
         # copy detections to all_detections
-        for label in range(generator.num_classes()):
-            if not generator.has_label(label):
-                continue
-
-            all_detections[i][label] = image_detections[image_detections[:, -1] == label, :-1]
+        for class_id in range(generator.num_classes()):
+            all_detections[i][class_id] = detections[detections[:, -1] == class_id, :-1]
 
     return all_detections
 
@@ -162,9 +168,9 @@ def evaluate(
         generator,
         model,
         iou_threshold=0.5,
-        score_threshold=0.05,
+        score_threshold=0.01,
         max_detections=100,
-        save_path=None,
+        visualize=False,
         epoch=0
 ):
     """
@@ -176,8 +182,7 @@ def evaluate(
         iou_threshold: The threshold used to consider when a detection is positive or negative.
         score_threshold: The score confidence threshold to use for detections.
         max_detections: The maximum number of detections to use per image.
-        save_path: The path to save images with visualized detections to.
-        epoch: epoch index
+        visualize: Show the visualized detections or not.
 
     Returns:
         A dict mapping class names to mAP scores.
@@ -185,14 +190,11 @@ def evaluate(
     """
     # gather all detections and annotations
     all_detections = _get_detections(generator, model, score_threshold=score_threshold, max_detections=max_detections,
-                                     save_path=save_path)
+                                     visualize=visualize)
     all_annotations = _get_annotations(generator)
     average_precisions = {}
-
-    # all_detections = pickle.load(open('fcos/all_detections_11.pkl', 'rb'))
-    # all_annotations = pickle.load(open('fcos/all_annotations.pkl', 'rb'))
-    # pickle.dump(all_detections, open('fcos/all_detections_{}.pkl'.format(epoch + 1), 'wb'))
-    # pickle.dump(all_annotations, open('fcos/all_annotations_{}.pkl'.format(epoch + 1), 'wb'))
+    num_tp = 0
+    num_fp = 0
 
     # process detections and annotations
     for label in range(generator.num_classes()):
@@ -243,41 +245,44 @@ def evaluate(
         false_positives = np.cumsum(false_positives)
         true_positives = np.cumsum(true_positives)
 
+        if false_positives.shape[0] == 0:
+            num_fp += 0
+        else:
+            num_fp += false_positives[-1]
+        if true_positives.shape[0] == 0:
+            num_tp += 0
+        else:
+            num_tp += true_positives[-1]
+
         # compute recall and precision
         recall = true_positives / num_annotations
         precision = true_positives / np.maximum(true_positives + false_positives, np.finfo(np.float64).eps)
-        print("TP: " + str(true_positives))
-        print("FP: " + str(false_positives))
-        print("Total annotations: " + str(num_annotations))
+        print("Precision: " + str(precision))
+        print("Recall: " + str(recall))
 
         # compute average precision
         average_precision = _compute_ap(recall, precision)
         average_precisions[label] = average_precision, num_annotations
+    
+    print('num_fp={}, num_tp={}, num_annotations={}'.format(num_fp, num_tp,num_annotations))
 
     return average_precisions
 
 
 if __name__ == '__main__':
-    from generators.voc_generator import PascalVocGenerator
-    from utils.image import preprocess_image
-    import models
+    from generators.pascal import PascalVocGenerator
+    from model import efficientdet
     import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+    phi = 1
+    weighted_bifpn = False
     common_args = {
         'batch_size': 1,
-        'image_min_side': 800,
-        'image_max_side': 1333,
-        'preprocess_image': preprocess_image,
+        'phi': phi,
     }
-    # generator = PascalVocGenerator(
-    #     'datasets/voc_trainval/VOC0712',
-    #     'val',
-    #     shuffle_groups=False,
-    #     skip_truncated=False,
-    #     skip_difficult=True,
-    #     **common_args
-    # )
-    generator = PascalVocGenerator(
+    test_generator = PascalVocGenerator(
         'datasets/VOC2007',
         'test',
         shuffle_groups=False,
@@ -285,21 +290,19 @@ if __name__ == '__main__':
         skip_difficult=True,
         **common_args
     )
-    model_path = 'snapshots/2019-08-25/resnet101_pascal_07_0.7352.h5'
-    # load retinanet model
-    import keras.backend as K
-    K.clear_session()
-    K.set_learning_phase(1)
-    model = models.load_model(model_path, backbone_name='resnet101')
-    # if the model is not converted to an inference model, use the line below
-    # see: https://github.com/fizyr/keras-retinanet#converting-a-training-model-to-inference-model
-    model = models.convert_model(model)
-    average_precisions = evaluate(generator, model, epoch=0)
+    model_path = 'checkpoints/2019-12-03/pascal_05_0.6283_1.1975_0.8029.h5'
+    input_shape = (test_generator.image_size, test_generator.image_size)
+    anchors = test_generator.anchors
+    num_classes = test_generator.num_classes()
+    model, prediction_model = efficientdet(phi=phi, num_classes=num_classes, weighted_bifpn=weighted_bifpn)
+    prediction_model.load_weights(model_path, by_name=True)
+    average_precisions = evaluate(test_generator, prediction_model, visualize=False)
     # compute per class average precision
     total_instances = []
     precisions = []
     for label, (average_precision, num_annotations) in average_precisions.items():
-        print('{:.0f} instances of class'.format(num_annotations), generator.label_to_name(label), 'with average precision: {:.4f}'.format(average_precision))
+        print('{:.0f} instances of class'.format(num_annotations), test_generator.label_to_name(label),
+              'with average precision: {:.4f}'.format(average_precision))
         total_instances.append(num_annotations)
         precisions.append(average_precision)
     mean_ap = sum(precisions) / sum(x > 0 for x in total_instances)
